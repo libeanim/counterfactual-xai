@@ -1,5 +1,6 @@
-from torch import nn
+import os
 import torch
+from torch import nn
 from torchvision import transforms
 from torchvision.models.resnet import resnet50
 import numpy as np
@@ -12,12 +13,16 @@ from datetime import datetime
 assert torch.cuda.is_available()
 print('CUDA is availbale', torch.cuda.is_available())
 
-# General output directory
-RESULT_DIR = 'results/resnet50new'
+torch.manual_seed(42)
+
 
 # Generate id to reference files/plots/images
 dt_id = datetime.now().isoformat()
 print(f'ID: {dt_id}')
+
+# General output directory
+RESULT_DIR = f'results/resnet50new/{dt_id}'
+os.mkdir(RESULT_DIR)
 
 
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -114,29 +119,29 @@ def get_accuracy(model, dataloader, cuda=True):
     return accuracy.numpy()
 
 
-# Load imagenet subset for weights initialisation
-train_latent = load_data('/home/bethge/ahochlehnert48/results/imnet_train_latent.npz')
-val_latent = load_data('/home/bethge/ahochlehnert48/results/imnet_val_latent.npz')
-print(f'Train latent: { sum([train_latent[i].size * train_latent[i].itemsize for i in range(len(train_latent))])/1024**2 } MB')
-print(f'Val latent:   { sum([val_latent[i].size * val_latent[i].itemsize for i in range(len(val_latent))])/1024**2 } MB')
-print(f'Train latent: { train_latent[0].size * train_latent[0].itemsize/1024**2 } MB')
+# # Load imagenet subset for weights initialisation
+# train_latent = load_data('/home/bethge/ahochlehnert48/results/imnet_train_latent.npz')
+# val_latent = load_data('/home/bethge/ahochlehnert48/results/imnet_val_latent.npz')
+# print(f'Train latent: { sum([train_latent[i].size * train_latent[i].itemsize for i in range(len(train_latent))])/1024**2 } MB')
+# print(f'Val latent:   { sum([val_latent[i].size * val_latent[i].itemsize for i in range(len(val_latent))])/1024**2 } MB')
+# print(f'Train latent: { train_latent[0].size * train_latent[0].itemsize/1024**2 } MB')
 
 
-## simplify labels
-train_bird_inds = (train_latent[2] >= 10) * (train_latent[2] <= 24)
-train_new_labels = -np.ones_like(train_latent[2])
-train_new_labels[train_bird_inds] = 1
-train_latent.insert(2, train_new_labels)
+# ## simplify labels
+# train_bird_inds = (train_latent[2] >= 10) * (train_latent[2] <= 24)
+# train_new_labels = -np.ones_like(train_latent[2])
+# train_new_labels[train_bird_inds] = 1
+# train_latent.insert(2, train_new_labels)
 
-print('Difference:', np.sum(train_latent[2]), 'of', np.size(train_latent[2]))
+# print('Difference:', np.sum(train_latent[2]), 'of', np.size(train_latent[2]))
 
-## simplify lables - not neccessary actually, left for compatibility reason
-val_bird_inds = (val_latent[2] >= 10) * (val_latent[2] <= 24)
-val_new_labels = -np.ones_like(val_latent[2])
-val_new_labels[val_bird_inds] = 1
-val_latent.insert(2, val_new_labels)
+# ## simplify lables - not neccessary actually, left for compatibility reason
+# val_bird_inds = (val_latent[2] >= 10) * (val_latent[2] <= 24)
+# val_new_labels = -np.ones_like(val_latent[2])
+# val_new_labels[val_bird_inds] = 1
+# val_latent.insert(2, val_new_labels)
 
-print('Difference:', np.sum(val_latent[2]), 'of', np.size(val_latent[2]))
+# print('Difference:', np.sum(val_latent[2]), 'of', np.size(val_latent[2]))
 
 
 import wandb
@@ -144,21 +149,37 @@ wandb.init(project='resnet-50-mpl', entity='libeanim')
 # 2. Save model inputs and hyperparameters
 config = wandb.config
 config.id = dt_id
-config.learning_rate = 0.001
+# config.learning_rate = 0.001
+config.learning_rate = 0.5
 config.momentum = 0.9
-config.epochs = 10
+config.epochs = 10  # 18
 config.log_steps = 100
 config.k = 3
+config.weight_decay = 1e-4
+config.batch_size = 64
+
+# Scheduler step size
+config.step_size = 20
+config.gamma = 0.1
+
+# Save config
+
+with open(f'{RESULT_DIR}/config.txt', 'w') as config_file: 
+    config_file.write(str(config.__dict__))
+
 
 # Initialise weights
-w = torch.Tensor(initialise_weights(config.k)).T
-# w=None
+# w = torch.Tensor(initialise_weights(config.k)).T
+w = None
 model = ResNet50NN(k=config.k, init_pl=w)
 
+## Load pretrained model (only works with k=3)
+model.load_state_dict(torch.load('/home/bethge/ahochlehnert48/results/resnet50new/2021-09-21T10:29:43.000481_final.pth'))
+
 # Delete latent data from memory and trigger garbage collector
-del train_latent
-del val_latent
-import gc; gc.collect()
+# del train_latent
+# del val_latent
+# import gc; gc.collect()
 
 
 train_dataset = ImageFolder(
@@ -179,15 +200,17 @@ val_dataset = ImageFolder(
     ])
 )
     
-train_loader = DataLoader(train_dataset, shuffle=True, batch_size=64)
-val_loader = DataLoader(val_dataset, shuffle=True, batch_size=64)
+train_loader = DataLoader(train_dataset, shuffle=True, batch_size=config.batch_size)
+val_loader = DataLoader(val_dataset, shuffle=True, batch_size=config.batch_size)
 
 
 wandb.watch(model)
 
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
+optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum,
+                      weight_decay=config.weight_decay)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=config.step_size, gamma=config.gamma)
 model.cuda()
 
 for epoch in range(config.epochs):  # loop over the dataset multiple times
@@ -205,6 +228,9 @@ for epoch in range(config.epochs):  # loop over the dataset multiple times
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
+
+        # learning rate decay
+        scheduler.step()
 
         # print statistics
         running_loss += loss.item()
