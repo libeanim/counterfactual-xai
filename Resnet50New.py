@@ -21,7 +21,7 @@ dt_id = datetime.now().isoformat()
 print(f'ID: {dt_id}')
 
 # General output directory
-RESULT_DIR = f'results/resnet50new/{dt_id}'
+RESULT_DIR = f'/home/bethge/ahochlehnert48/results/resnet50new/{dt_id}'
 os.mkdir(RESULT_DIR)
 print('Result dir:', RESULT_DIR)
 
@@ -48,78 +48,94 @@ def load_data(npz_file: str):
     arr = np.load(npz_file)
     return [arr['arr_0'], arr['arr_1'], arr['arr_2']]
 
-def initialise_weights(k):
-    """
-    Initialise weights of the k-prototype vectors per class.
+# def initialise_weights(k):
+#     """
+#     Initialise weights of the k-prototype vectors per class.
     
-    Currently the prototype vectors are randomly chosen from
-    the latent training samples of a specific class. This should
-    be replaced by a more sophisticated clustering.
+#     Currently the prototype vectors are randomly chosen from
+#     the latent training samples of a specific class. This should
+#     be replaced by a more sophisticated clustering.
 
-    If no latent space training sample of a class is present
-    the weights are initialised uniformly random.
-    """
-    def build_init_m(m, k, arr, y):
-        assert arr.shape[1] == k
-        m[:, y*k:y*k + k] = arr
-        return m
+#     If no latent space training sample of a class is present
+#     the weights are initialised uniformly random.
+#     """
+#     def build_init_m(m, k, arr, y):
+#         assert arr.shape[1] == k
+#         m[:, y*k:y*k + k] = arr
+#         return m
 
-    df = np.random.uniform(size=[2048, k*1000])
+#     df = np.random.uniform(size=[2048, k*1000])
 
-    for y in np.unique(train_latent[3]):
-        # Get all latentn samples of class y
-        tmp = train_latent[1][train_latent[3] == y]
-        # Randomly select k indices
-        inds = np.random.randint(0, tmp.shape[0], k)
-        # Build weights from selected samples
-        df = build_init_m(df, k, tmp[inds].T, y)
+#     for y in np.unique(train_latent[3]):
+#         # Get all latentn samples of class y
+#         tmp = train_latent[1][train_latent[3] == y]
+#         # Randomly select k indices
+#         inds = np.random.randint(0, tmp.shape[0], k)
+#         # Build weights from selected samples
+#         df = build_init_m(df, k, tmp[inds].T, y)
     
-    return df
+#     return df
     
 
 class ResNet50NN(nn.Module):
     
-    def __init__(self, k=2, pretrained=True, init_pl=None, **kwargs):
+    def __init__(self,
+            k:int = 2, pretrained:bool = True,
+            init_readout_weights:torch.Tensor = None,
+            init_readout_bias: torch.Tensor = None,
+            freeze_backbone: bool = False, **kwargs):
+        """
+        :param k: (int) number of readout vectors
+        :param pretrained: (bool) use pretrained backbone
+        :param init_readout_weights: (numpy.array) 
+        :param init_readout_bias: (numpy.array)
+        :param freeze_backbone: (bool) free backbone during training
+        """
         super().__init__()
         self.backbone = resnet50(pretrained=pretrained)
         self.backbone.fc = nn.Identity()
-        
-        
-        self.pl = nn.Linear(2048, k * 1000)
-        if init_pl is not None:
-            assert init_pl.shape[1] == 2048
-            self.pl.weight.data = init_pl
 
-        self.ml = nn.MaxPool1d(k)
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        
+        
+        self.readout = nn.Linear(2048, k * 1000)
+        if init_readout_weights is not None:
+            assert init_readout_weights.shape[1] == 2048
+            self.readout.weight.data = init_readout_weights
+        if init_readout_bias is not None:
+            # assert init_readout_bias.shape[1] == 2048
+            self.readout.bias.data = init_readout_bias
+
+        self.max_pool = nn.MaxPool1d(k)
 
         
     def forward(self, x):
         
         x = self.backbone(x)
-        x = self.pl(x)
-        x = torch.squeeze(self.ml(x.unsqueeze(0)))
+        x = self.readout(x)
+        x = torch.squeeze(self.max_pool(x.unsqueeze(0)))
         
         return x
 
-def get_accuracy(model: nn.Module, dataloader: DataLoader, cuda: bool = True):
-    accuracy, steps = 0, 0
-    model.eval()
-    with torch.no_grad():
-        for inputs, lables in dataloader:
-
+def get_accuracy(model, loader, cuda=True):
+    correct = 0
+    total = 0
+    # since we're not training, we don't need to calculate the gradients for our outputs
+    with torch.inference_mode():
+        for data in loader:
+            images, labels = data
             if cuda:
-                inputs, labels = inputs.cuda(), labels.cuda()
+                images, labels = images.cuda(), labels.cuda()
+            # calculate outputs by running images through the network
+            outputs = model(images)
+            # the class with the highest energy is what we choose as prediction
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-            outputs = model(inputs)
-            predictions = torch.argmax(outputs, axis=1)
-
-            accuracy += torch.sum(predictions == lables) / lables.shape[0]
-            steps += 1
-        accuracy = accuracy / steps
-        if cuda:
-            accuracy = accuracy.cpu()
-    model.train()
-    return accuracy.numpy()
+    return correct / total
 
 # LOAD CONFIG
 config = dict(
@@ -141,7 +157,9 @@ config = dict(
     # step_size = 100,
     # scheduler = 'MultiStepLR',
     # milestones = [30, 60, 90, 130, 150], #[10, 20, 30, 40, 50, 60]#[15, 30, 60, 90, 110, 140]
-    # gamma = 0.1
+    # gamma = 0.1,
+    # freeze_backbone = False,
+    init_readout = None,
 )
 if len(sys.argv) == 2:
     cfg_path = sys.argv[1]
@@ -189,10 +207,23 @@ with open(f'{RESULT_DIR}/config.txt', 'w') as config_file:
 
 
 # Initialise weights
+if config["init_readout"] == 'fc_noisy':
+    print('---> noisy fc')
+    last_layer = resnet50(pretrained=True).fc
+    w = np.repeat(last_layer.weight.data.numpy(), repeats=config["k"], axis=0)
+    b = np.repeat(last_layer.bias.data.numpy(), repeats=config["k"], axis=0)
+    w += 0.1 * w * np.random.uniform(size=[config["k"]*1000, 2048])
+    b += 0.1 * b * np.random.uniform(size=[config["k"]*1000])
 # w = torch.Tensor(initialise_weights(config["k"])).T
-w = None
+else:
+    w = None
+    b = None
 if config['model'] == "resnet50new":
-    model = ResNet50NN(k=config["k"], init_pl=w)
+    model = ResNet50NN(
+        k=config["k"],
+        init_readout_weights=torch.Tensor(w),
+        init_readout_bias=torch.Tensor(b),
+        freeze_backbone=config["freeze_backbone"])
 elif config["model"] == "resnet50":
     model = resnet50(pretrained=False)
 else:
@@ -205,8 +236,9 @@ if config["base_model"] is not None:
 
 
 import wandb
+# wandb.init()
 wandb.init(project='resnet-50-mpl', entity='libeanim', config=config)
-
+    # settings=wandb.Settings(start_method='fork'))
 # Delete latent data from memory and trigger garbage collector
 # del train_latent
 # del val_latent
@@ -226,13 +258,14 @@ train_dataset = ImageFolder(
 val_dataset = ImageFolder(
     '/mnt/qb/datasets/ImageNet2012/val',
     transforms.Compose([
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         normalize,
     ])
 )
     
-train_loader = DataLoader(train_dataset, shuffle=True, batch_size=config["batch_size"])
-val_loader = DataLoader(val_dataset, shuffle=True, batch_size=config["batch_size"])
+train_loader = DataLoader(train_dataset, shuffle=True, batch_size=config["batch_size"], num_workers=1)
+val_loader = DataLoader(val_dataset, shuffle=False, batch_size=config["batch_size"], num_workers=1)
 
 
 wandb.watch(model)
@@ -287,6 +320,9 @@ for epoch in range(config["epochs"]):  # loop over the dataset multiple times
             running_accuracy = 0
         
     # learning rate decay
+    # model.eval()
+    # wandb.log({ "test_accuracy": get_accuracy(model, val_loader) })
+    # model.train()
     if scheduler is not None:
         scheduler.step()
     
