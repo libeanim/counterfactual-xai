@@ -5,7 +5,8 @@ from torchvision.models import resnet50
 import torchvision.transforms.functional as TF
 
 import numpy as np
-from sklearn.neighbors import KNeighborsClassifier
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KNeighborsClassifier, DistanceMetric
 from sklearn.metrics import f1_score
 from datetime import datetime
 
@@ -84,22 +85,21 @@ print('Difference:', np.sum(val_latent[2]), 'of', np.size(val_latent[2]))
 
 RESULT_DIR = '/home/bethge/ahochlehnert48/results/knn'
 
-# Initial weight vector for importance weighting
-# all ones = no change in scalar product
+
 w = np.ones((1, train_latent[1].shape[1]))
 
 
-def fit_classifier(params, metric='euclidean', n_neighbors=1):
-    clf = KNeighborsClassifier(n_neighbors=n_neighbors, metric=metric)
+def newc(params, metric='euclidean'):
+    clf = KNeighborsClassifier(n_neighbors=1, metric=metric)
     clf.fit(params * train_latent[1], train_latent[2])
     pred_y = clf.predict(val_latent[1])
     return f1_score(val_latent[2], pred_y), clf
 
 
-def objective(params):
-    f1, _ = fit_classifier(params)
+def f(params):
+    f1, _ = newc(params)
     return -f1
 
-res = minimize(objective, w, method="Nelder-Mead",
-               options={"disp": True, "return_all": False, "adaptive": True})
+res = minimize(f, w, method="dogleg",
+               options={"disp": True, "return_all": False})
 np.save(f'{RESULT_DIR}/{dt_id}_w.npy', res.x)
